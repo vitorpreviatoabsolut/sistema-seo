@@ -1,0 +1,5 @@
+{
+  "name": "SEO Text Generator",
+  "description": "Sistema de geração de textos otimizados para SEO usando Gemini, multiplicando palavras-chave por regiões.",
+  "requestFramePermissions": []
+}
