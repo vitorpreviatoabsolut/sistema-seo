@@ -1,0 +1,9 @@
+RewriteEngine On
+
+# Redirecionar todas as requisições /api/* para api.php
+RewriteRule ^api/(.*)$ api.php [QSA,L]
+
+# Para servir o frontend (index.html) para outras rotas (SPA)
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule . /index.html [L]
