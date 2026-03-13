@@ -284,18 +284,14 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
               });
               break; // Success, exit retry loop
             } catch (err: any) {
-              const isRateLimit = err.message && err.message.includes('429');
-              const isUnavailable = err.message && (err.message.includes('503') || err.message.includes('UNAVAILABLE'));
-              const isLimited = isRateLimit || isUnavailable;
-
-              if (isLimited) {
+              if (err.message && err.message.includes('429')) {
                 retries--;
                 if (retries === 0) throw err;
-                setJobStatus({ status: 'running', progress: completed, total, message: `Serviço ocupado. Tentando de novo em ${delay / 1000}s... (${retries} tentativas restantes)` });
+                setJobStatus({ status: 'running', progress: completed, total, message: `Aguardando limite de requisições... (${retries} tentativas restantes)` });
                 await new Promise(resolve => setTimeout(resolve, delay));
                 delay *= 2; // Exponential backoff
               } else {
-                throw err; // Re-throw if it's not a rate limit / service unavailable error
+                throw err; // Re-throw if it's not a rate limit error
               }
             }
           }

@@ -1,9 +1,8 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { pool } from './src/db.js';
+import { db } from './src/db.js';
 import fs from 'fs';
 import path from 'path';
-import { ResultSetHeader } from 'mysql2';
 
 const app = express();
 app.use(express.json());
@@ -19,81 +18,86 @@ app.get('/api/check-key', (req, res) => {
   });
 });
 
-app.get('/api/clients', async (req, res) => {
-  const [rows] = await pool.execute('SELECT * FROM clients');
-  res.json(rows);
+app.get('/api/clients', (req, res) => {
+  const clients = db.prepare('SELECT * FROM clients').all();
+  res.json(clients);
 });
 
-app.post('/api/clients', async (req, res) => {
+app.post('/api/clients', (req, res) => {
   const { name, context } = req.body;
-  const [result] = await pool.execute('INSERT INTO clients (name, context) VALUES (?, ?)', [name, context || '']) as [ResultSetHeader, any];
-  res.json({ id: result.insertId, name, context });
+  const stmt = db.prepare('INSERT INTO clients (name, context) VALUES (?, ?)');
+  const info = stmt.run(name, context || '');
+  res.json({ id: info.lastInsertRowid, name, context });
 });
 
-app.delete('/api/clients/:id', async (req, res) => {
-  await pool.execute('DELETE FROM clients WHERE id = ?', [req.params.id]);
+app.delete('/api/clients/:id', (req, res) => {
+  db.prepare('DELETE FROM clients WHERE id = ?').run(req.params.id);
   res.json({ success: true });
 });
 
-app.get('/api/clients/:id/keywords', async (req, res) => {
-  const [rows] = await pool.execute('SELECT * FROM keywords WHERE client_id = ?', [req.params.id]);
-  res.json(rows);
+app.get('/api/clients/:id/keywords', (req, res) => {
+  const keywords = db.prepare('SELECT * FROM keywords WHERE client_id = ?').all(req.params.id);
+  res.json(keywords);
 });
 
-app.post('/api/clients/:id/keywords', async (req, res) => {
+app.post('/api/clients/:id/keywords', (req, res) => {
   const { keyword } = req.body;
-  const [result] = await pool.execute('INSERT INTO keywords (client_id, keyword) VALUES (?, ?)', [req.params.id, keyword]) as [ResultSetHeader, any];
-  res.json({ id: result.insertId, client_id: req.params.id, keyword });
+  const stmt = db.prepare('INSERT INTO keywords (client_id, keyword) VALUES (?, ?)');
+  const info = stmt.run(req.params.id, keyword);
+  res.json({ id: info.lastInsertRowid, client_id: req.params.id, keyword });
 });
 
-app.delete('/api/keywords/:id', async (req, res) => {
-  await pool.execute('DELETE FROM keywords WHERE id = ?', [req.params.id]);
+app.delete('/api/keywords/:id', (req, res) => {
+  db.prepare('DELETE FROM keywords WHERE id = ?').run(req.params.id);
   res.json({ success: true });
 });
 
-app.get('/api/clients/:id/regions', async (req, res) => {
-  const [rows] = await pool.execute('SELECT * FROM regions WHERE client_id = ?', [req.params.id]);
-  res.json(rows);
+app.get('/api/clients/:id/regions', (req, res) => {
+  const regions = db.prepare('SELECT * FROM regions WHERE client_id = ?').all(req.params.id);
+  res.json(regions);
 });
 
-app.post('/api/clients/:id/regions', async (req, res) => {
+app.post('/api/clients/:id/regions', (req, res) => {
   const { region } = req.body;
-  const [result] = await pool.execute('INSERT INTO regions (client_id, region) VALUES (?, ?)', [req.params.id, region]) as [ResultSetHeader, any];
-  res.json({ id: result.insertId, client_id: req.params.id, region });
+  const stmt = db.prepare('INSERT INTO regions (client_id, region) VALUES (?, ?)');
+  const info = stmt.run(req.params.id, region);
+  res.json({ id: info.lastInsertRowid, client_id: req.params.id, region });
 });
 
-app.delete('/api/regions/:id', async (req, res) => {
-  await pool.execute('DELETE FROM regions WHERE id = ?', [req.params.id]);
+app.delete('/api/regions/:id', (req, res) => {
+  db.prepare('DELETE FROM regions WHERE id = ?').run(req.params.id);
   res.json({ success: true });
 });
 
-app.get('/api/clients/:id/template', async (req, res) => {
-  const [rows] = await pool.execute('SELECT * FROM templates WHERE client_id = ?', [req.params.id]);
-  res.json(rows[0] || { content: '' });
+app.get('/api/clients/:id/template', (req, res) => {
+  const template = db.prepare('SELECT * FROM templates WHERE client_id = ?').get(req.params.id);
+  res.json(template || { content: '' });
 });
 
-app.post('/api/clients/:id/template', async (req, res) => {
+app.post('/api/clients/:id/template', (req, res) => {
   const { content } = req.body;
-  await pool.execute(`
+  const stmt = db.prepare(`
     INSERT INTO templates (client_id, content) VALUES (?, ?)
-    ON DUPLICATE KEY UPDATE content = VALUES(content)
-  `, [req.params.id, content]);
+    ON CONFLICT(client_id) DO UPDATE SET content = excluded.content
+  `);
+  stmt.run(req.params.id, content);
   res.json({ success: true });
 });
 
-app.get('/api/global-templates', async (req, res) => {
-  const [rows] = await pool.execute('SELECT * FROM global_templates');
-  res.json(rows);
+app.get('/api/global-templates', (req, res) => {
+  const templates = db.prepare('SELECT * FROM global_templates').all();
+  res.json(templates);
 });
 
-app.post('/api/global-templates', async (req, res) => {
+app.post('/api/global-templates', (req, res) => {
   const { name, content } = req.body;
-  const [result] = await pool.execute('INSERT INTO global_templates (name, content) VALUES (?, ?)', [name, content]) as [ResultSetHeader, any];
-  res.json({ id: result.insertId, name, content });
+  const stmt = db.prepare('INSERT INTO global_templates (name, content) VALUES (?, ?)');
+  const info = stmt.run(name, content);
+  res.json({ id: info.lastInsertRowid, name, content });
 });
 
-app.delete('/api/global-templates/:id', async (req, res) => {
-  await pool.execute('DELETE FROM global_templates WHERE id = ?', [req.params.id]);
+app.delete('/api/global-templates/:id', (req, res) => {
+  db.prepare('DELETE FROM global_templates WHERE id = ?').run(req.params.id);
   res.json({ success: true });
 });
 
