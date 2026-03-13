@@ -84,6 +84,23 @@ app.post('/api/clients/:id/template', (req, res) => {
   res.json({ success: true });
 });
 
+app.get('/api/global-templates', (req, res) => {
+  const templates = db.prepare('SELECT * FROM global_templates').all();
+  res.json(templates);
+});
+
+app.post('/api/global-templates', (req, res) => {
+  const { name, content } = req.body;
+  const stmt = db.prepare('INSERT INTO global_templates (name, content) VALUES (?, ?)');
+  const info = stmt.run(name, content);
+  res.json({ id: info.lastInsertRowid, name, content });
+});
+
+app.delete('/api/global-templates/:id', (req, res) => {
+  db.prepare('DELETE FROM global_templates WHERE id = ?').run(req.params.id);
+  res.json({ success: true });
+});
+
 // Vite middleware
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {

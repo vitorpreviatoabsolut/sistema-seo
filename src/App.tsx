@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, Download, Play, FileText, MapPin, Key, Users, Settings, Loader2, MessageCircle } from 'lucide-react';
+import { Plus, Trash2, Download, Play, FileText, MapPin, Key, Users, Settings, Loader2, MessageCircle, Save, FolderOpen } from 'lucide-react';
 import { GoogleGenAI } from '@google/genai';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
@@ -18,6 +18,12 @@ interface Keyword {
 interface Region {
   id: number;
   region: string;
+}
+
+interface GlobalTemplate {
+  id: number;
+  name: string;
+  content: string;
 }
 
 export default function App() {
@@ -49,6 +55,11 @@ export default function App() {
   const [clientToDelete, setClientToDelete] = useState<number | null>(null);
   const [toast, setToast] = useState<{message: string, type: 'success' | 'error'} | null>(null);
 
+  // Global Templates State
+  const [globalTemplates, setGlobalTemplates] = useState<GlobalTemplate[]>([]);
+  const [showSaveTemplateModal, setShowSaveTemplateModal] = useState(false);
+  const [newTemplateName, setNewTemplateName] = useState('');
+
   const showToast = (message: string, type: 'success' | 'error' = 'success') => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 3000);
@@ -56,6 +67,7 @@ export default function App() {
 
   useEffect(() => {
     fetchClients();
+    fetchGlobalTemplates();
   }, []);
 
   useEffect(() => {
@@ -70,6 +82,12 @@ export default function App() {
     const res = await fetch('/api/clients');
     const data = await res.json();
     setClients(data);
+  };
+
+  const fetchGlobalTemplates = async () => {
+    const res = await fetch('/api/global-templates');
+    const data = await res.json();
+    setGlobalTemplates(data);
   };
 
   const addClient = async (e: React.FormEvent) => {
@@ -164,17 +182,41 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: template })
     });
-    showToast('Template salvo com sucesso!');
+    showToast('Template salvo para este cliente com sucesso!');
+  };
+
+  const saveGlobalTemplate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newTemplateName.trim() || !template.trim()) return;
+    const res = await fetch('/api/global-templates', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newTemplateName, content: template })
+    });
+    if (res.ok) {
+      setNewTemplateName('');
+      setShowSaveTemplateModal(false);
+      fetchGlobalTemplates();
+      showToast('Template salvo na biblioteca com sucesso!');
+    }
+  };
+
+  const deleteGlobalTemplate = async (id: number) => {
+    if (!confirm('Tem certeza que deseja excluir este template da biblioteca?')) return;
+    await fetch(`/api/global-templates/${id}`, { method: 'DELETE' });
+    fetchGlobalTemplates();
+    showToast('Template removido da biblioteca.');
+  };
+
+  const loadGlobalTemplate = (content: string) => {
+    setTemplate(content);
+    showToast('Template carregado com sucesso!');
   };
 
   const generateTexts = async () => {
     if (!selectedClient) return;
     if (keywords.length === 0) {
       showToast('Por favor, adicione pelo menos uma palavra-chave antes de gerar.', 'error');
-      return;
-    }
-    if (regions.length === 0) {
-      showToast('Por favor, adicione pelo menos uma região antes de gerar.', 'error');
       return;
     }
     if (!template.trim()) {
@@ -194,7 +236,8 @@ export default function App() {
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const total = keywords.length * regions.length;
+      const regionsToProcess = regions.length > 0 ? regions : [{ id: 0, region: '' }];
+      const total = keywords.length * regionsToProcess.length;
       let completed = 0;
       
       setJobStatus({ status: 'running', progress: 0, total, message: 'Iniciando...' });
@@ -202,24 +245,27 @@ export default function App() {
       const zip = new JSZip();
 
       for (const kw of keywords) {
-        for (const reg of regions) {
+        for (const reg of regionsToProcess) {
           const keyword = kw.keyword;
           const region = reg.region;
           
-          setJobStatus({ status: 'running', progress: completed, total, message: `Gerando: ${keyword} em ${region}...` });
+          const regionText = region ? ` em ${region}` : '';
+          const regionPromptText = region ? ` na região de '${region}'` : '';
+          
+          setJobStatus({ status: 'running', progress: completed, total, message: `Gerando: ${keyword}${regionText}...` });
 
-          const prompt = `Você é um Especialista Sênior em SEO e Copywriting. Sua tarefa é escrever um texto completo, longo e altamente otimizado para SEO sobre '${keyword}' na região de '${region}'.
+          const prompt = `Você é um Especialista Sênior em SEO e Copywriting. Sua tarefa é escrever um texto completo, longo e altamente otimizado para SEO sobre '${keyword}'${regionPromptText}.
 O cliente é '${selectedClient.name}'. Informações adicionais sobre o cliente/serviço: '${selectedClient.context}'.
 
 DIRETRIZES DE SEO E SEMÂNTICA (MUITO IMPORTANTE):
 1. Estrutura Completa: O texto deve ser aprofundado, persuasivo e cobrir o assunto de ponta a ponta para garantir a melhor performance de ranqueamento no Google.
 2. Hierarquia de Títulos: NÃO utilize a tag <h1> (ela já será incluída manualmente no template). Comece a sua hierarquia de títulos obrigatoriamente a partir do <h2> para os tópicos principais, e <h3> para subtópicos.
 3. Elementos HTML: Utilize parágrafos (<p>), listas (<ul>/<li>), negrito (<strong>) para termos importantes, e inclua pelo menos um link (<a>) contextualizado (pode usar '#' como href se não houver URL específica, ex: <a href="#">fale conosco</a>).
-4. Palavra-chave: Inclua a exata frase '${keyword} em ${region}' (ou variações naturais) de forma estratégica e natural ao longo do texto (pelo menos 3 a 5 vezes, distribuídas entre os H2/H3 e o corpo do texto).
+4. Palavra-chave: Inclua a exata frase '${keyword}${regionText}' (ou variações naturais) de forma estratégica e natural ao longo do texto (pelo menos 3 a 5 vezes, distribuídas entre os H2/H3 e o corpo do texto).
 
 Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
 {
-  "metaDescription": "Uma meta description persuasiva e otimizada para SEO, contendo a palavra-chave e a região, com no máximo 160 caracteres.",
+  "metaDescription": "Uma meta description persuasiva e otimizada para SEO, contendo a palavra-chave${region ? ' e a região' : ''}, com no máximo 160 caracteres.",
   "seoText": "O código HTML puro do texto completo, sem as tags <html>, <head> ou <body>."
 }`;
 
@@ -267,7 +313,7 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
           // Clean up potential markdown blocks just in case
           seoText = seoText.replace(/^```html\n?/m, '').replace(/^```\n?/m, '').replace(/```$/m, '').trim();
 
-          const title = `${keyword} em ${region} - ${selectedClient.name}`;
+          const title = `${keyword}${regionText} - ${selectedClient.name}`;
           
           // Generate WhatsApp Link
           const cleanNumber = whatsappNumber.replace(/\D/g, '');
@@ -282,10 +328,10 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
           fileContent = fileContent.replace(/\{\{REGION\}\}/g, region);
           fileContent = fileContent.replace(/\{\{WHATSAPP_LINK\}\}/g, whatsappLink);
 
-          // Create filename: keyword-region.php
+          // Create filename: keyword-region.php or keyword.php
           const safeKeyword = keyword.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-          const safeRegion = region.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-          const filename = `${safeKeyword}-${safeRegion}.php`;
+          const safeRegion = region ? region.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') : '';
+          const filename = safeRegion ? `${safeKeyword}-${safeRegion}.php` : `${safeKeyword}.php`;
 
           zip.file(filename, fileContent);
           
@@ -315,6 +361,43 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
 
   return (
     <div className="flex h-screen bg-gray-50 text-gray-900 font-sans relative">
+      {/* Save Template Modal */}
+      {showSaveTemplateModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl p-6 w-full max-w-md shadow-xl">
+            <h3 className="text-lg font-bold mb-4">Salvar Template na Biblioteca</h3>
+            <form onSubmit={saveGlobalTemplate}>
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Nome do Template</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Ex: Template Landing Page Padrão"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                  value={newTemplateName}
+                  onChange={(e) => setNewTemplateName(e.target.value)}
+                />
+              </div>
+              <div className="flex justify-end gap-3">
+                <button 
+                  type="button" 
+                  onClick={() => setShowSaveTemplateModal(false)}
+                  className="px-4 py-2 bg-white text-gray-700 rounded-md hover:bg-gray-50 border border-gray-300 font-medium text-sm"
+                >
+                  Cancelar
+                </button>
+                <button 
+                  type="submit"
+                  className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 font-medium text-sm"
+                >
+                  Salvar
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Toast Notification */}
       {toast && (
         <div className={`absolute top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg text-sm font-medium transition-all ${toast.type === 'error' ? 'bg-red-100 text-red-800 border border-red-200' : 'bg-green-100 text-green-800 border border-green-200'}`}>
@@ -490,14 +573,49 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
 
               {/* Template */}
               <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-200 mb-6">
-                <div className="flex items-center justify-between mb-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-4 gap-4">
                   <h3 className="text-lg font-medium flex items-center gap-2">
                     <Settings className="w-5 h-5 text-indigo-500" />
                     Template Base (modelo.php)
                   </h3>
-                  <button onClick={saveTemplate} className="px-4 py-2 bg-indigo-50 text-indigo-700 rounded-md hover:bg-indigo-100 font-medium text-sm border border-indigo-200">
-                    Salvar Template
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {globalTemplates.length > 0 && (
+                      <div className="relative group">
+                        <button className="px-3 py-2 bg-white text-gray-700 rounded-md hover:bg-gray-50 font-medium text-sm border border-gray-300 flex items-center gap-2">
+                          <FolderOpen className="w-4 h-4" />
+                          Carregar Template
+                        </button>
+                        <div className="absolute right-0 mt-1 w-64 bg-white border border-gray-200 rounded-md shadow-lg hidden group-hover:block z-10">
+                          <ul className="py-1 max-h-60 overflow-auto">
+                            {globalTemplates.map(gt => (
+                              <li key={gt.id} className="flex items-center justify-between px-4 py-2 hover:bg-gray-50">
+                                <button 
+                                  className="text-sm text-left flex-1 truncate text-gray-700"
+                                  onClick={() => loadGlobalTemplate(gt.content)}
+                                >
+                                  {gt.name}
+                                </button>
+                                <button 
+                                  onClick={() => deleteGlobalTemplate(gt.id)}
+                                  className="text-gray-400 hover:text-red-500 ml-2"
+                                  title="Excluir template"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    )}
+                    <button onClick={() => setShowSaveTemplateModal(true)} className="px-3 py-2 bg-white text-indigo-600 rounded-md hover:bg-indigo-50 font-medium text-sm border border-indigo-200 flex items-center gap-2">
+                      <Save className="w-4 h-4" />
+                      Salvar na Biblioteca
+                    </button>
+                    <button onClick={saveTemplate} className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 font-medium text-sm border border-transparent">
+                      Salvar para Cliente
+                    </button>
+                  </div>
                 </div>
                 <p className="text-sm text-gray-500 mb-3">
                   Use as tags <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{SEO_TEXT}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{TITLE}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{DESCRIPTION}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{KEYWORD}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{REGION}}"}</code> e <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{WHATSAPP_LINK}}"}</code>.
@@ -514,7 +632,7 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
               <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col items-center justify-center text-center">
                 <h3 className="text-xl font-bold mb-2">Gerar Textos SEO</h3>
                 <p className="text-gray-500 mb-6 max-w-lg">
-                  Serão gerados <strong>{keywords.length * regions.length}</strong> arquivos PHP combinando cada palavra-chave com cada região usando a API do Gemini.
+                  Serão gerados <strong>{keywords.length * (regions.length > 0 ? regions.length : 1)}</strong> arquivos PHP {regions.length > 0 ? 'combinando cada palavra-chave com cada região' : 'para cada palavra-chave'} usando a API do Gemini.
                 </p>
                 
                 {(!jobStatus || jobStatus.status === 'error') && !isGenerating && (

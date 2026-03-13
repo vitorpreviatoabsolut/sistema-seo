@@ -36,6 +36,12 @@ db.exec(`
       content TEXT NOT NULL,
       FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE
   );
+
+  CREATE TABLE IF NOT EXISTS global_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      content TEXT NOT NULL
+  );
 `);
 
 db.pragma('journal_mode = WAL');
