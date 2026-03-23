@@ -1,7 +1,4 @@
-import dotenv from 'dotenv';
-dotenv.config();
-
-import mysql from 'mysql2/promise';
+import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 
@@ -10,62 +7,54 @@ if (!fs.existsSync(dbDir)) {
   fs.mkdirSync(dbDir, { recursive: true });
 }
 
-export const pool = mysql.createPool({
-  host: process.env.DB_HOST || '162.241.2.49',
-  user: process.env.DB_USER || 'abso7751_sistemaseo',
-  password: process.env.DB_PASSWORD || 'Ravxl!@#$%1',
-  database: process.env.DB_NAME || 'abso7751_sistemaseo',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
-});
+export const db = new Database(path.join(dbDir, 'seo.db'));
 
-(async () => {
-  const connection = await pool.getConnection();
-  try {
-    await connection.execute(`
-      CREATE TABLE IF NOT EXISTS clients (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        context TEXT
-      )
-    `);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS clients (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      context TEXT
+  );
 
-    await connection.execute(`
-      CREATE TABLE IF NOT EXISTS keywords (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        client_id INT,
-        keyword VARCHAR(255) NOT NULL,
-        FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE
-      )
-    `);
+  CREATE TABLE IF NOT EXISTS keywords (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id INTEGER,
+      keyword TEXT NOT NULL,
+      FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE
+  );
 
-    await connection.execute(`
-      CREATE TABLE IF NOT EXISTS regions (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        client_id INT,
-        region VARCHAR(255) NOT NULL,
-        FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE
-      )
-    `);
+  CREATE TABLE IF NOT EXISTS regions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id INTEGER,
+      region TEXT NOT NULL,
+      FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE
+  );
 
-    await connection.execute(`
-      CREATE TABLE IF NOT EXISTS templates (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        client_id INT UNIQUE,
-        content TEXT NOT NULL,
-        FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE
-      )
-    `);
+  CREATE TABLE IF NOT EXISTS templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id INTEGER UNIQUE,
+      content TEXT NOT NULL,
+      FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE
+  );
 
-    await connection.execute(`
-      CREATE TABLE IF NOT EXISTS global_templates (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        content TEXT NOT NULL
-      )
-    `);
-  } finally {
-    connection.release();
-  }
-})();
+  CREATE TABLE IF NOT EXISTS global_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      content TEXT NOT NULL
+  );
+`);
+
+try {
+  db.exec(`ALTER TABLE clients ADD COLUMN whatsapp_number TEXT DEFAULT ''`);
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec(`ALTER TABLE clients ADD COLUMN whatsapp_message TEXT DEFAULT ''`);
+} catch (e) {
+  // Column already exists
+}
+
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');

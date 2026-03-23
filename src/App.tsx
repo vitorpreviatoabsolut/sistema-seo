@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Plus, Trash2, Download, Play, FileText, MapPin, Key, Users, Settings, Loader2, MessageCircle, Save, FolderOpen } from 'lucide-react';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 
@@ -8,6 +8,8 @@ interface Client {
   id: number;
   name: string;
   context: string;
+  whatsapp_number?: string;
+  whatsapp_message?: string;
 }
 
 interface Keyword {
@@ -75,6 +77,8 @@ export default function App() {
       fetchKeywords(selectedClient.id);
       fetchRegions(selectedClient.id);
       fetchTemplate(selectedClient.id);
+      setWhatsappNumber(selectedClient.whatsapp_number || '');
+      setWhatsappMessage(selectedClient.whatsapp_message || '');
     }
   }, [selectedClient]);
 
@@ -120,11 +124,14 @@ export default function App() {
 
   const addKeyword = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newKeyword || !selectedClient) return;
-    await fetch(`/api/clients/${selectedClient.id}/keywords`, {
+    if (!newKeyword.trim() || !selectedClient) return;
+    
+    const keywordsArray = newKeyword.split(/[\n,]+/).map(k => k.trim()).filter(k => k);
+    
+    await fetch(`/api/clients/${selectedClient.id}/keywords/bulk`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ keyword: newKeyword })
+      body: JSON.stringify({ keywords: keywordsArray })
     });
     setNewKeyword('');
     fetchKeywords(selectedClient.id);
@@ -142,11 +149,14 @@ export default function App() {
 
   const addRegion = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newRegion || !selectedClient) return;
-    await fetch(`/api/clients/${selectedClient.id}/regions`, {
+    if (!newRegion.trim() || !selectedClient) return;
+    
+    const regionsArray = newRegion.split(/[\n,]+/).map(r => r.trim()).filter(r => r);
+    
+    await fetch(`/api/clients/${selectedClient.id}/regions/bulk`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ region: newRegion })
+      body: JSON.stringify({ regions: regionsArray })
     });
     setNewRegion('');
     fetchRegions(selectedClient.id);
@@ -173,6 +183,22 @@ export default function App() {
   </main>
 </body>
 </html>`);
+  };
+
+  const saveWhatsappConfig = async () => {
+    if (!selectedClient) return;
+    await fetch(`/api/clients/${selectedClient.id}/whatsapp`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ whatsapp_number: whatsappNumber, whatsapp_message: whatsappMessage })
+    });
+    
+    // Update local state so it persists if we switch clients and come back
+    const updatedClient = { ...selectedClient, whatsapp_number: whatsappNumber, whatsapp_message: whatsappMessage };
+    setSelectedClient(updatedClient);
+    setClients(clients.map(c => c.id === selectedClient.id ? updatedClient : c));
+    
+    showToast('Configuração do WhatsApp salva com sucesso!');
   };
 
   const saveTemplate = async () => {
@@ -280,22 +306,32 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                 contents: prompt,
                 config: {
                   responseMimeType: 'application/json',
+                  responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                      metaDescription: {
+                        type: Type.STRING,
+                        description: "Uma meta description persuasiva e otimizada para SEO, contendo a palavra-chave, com no máximo 160 caracteres."
+                      },
+                      seoText: {
+                        type: Type.STRING,
+                        description: "O código HTML puro do texto completo, sem as tags <html>, <head> ou <body>."
+                      }
+                    },
+                    required: ["metaDescription", "seoText"]
+                  }
                 }
               });
               break; // Success, exit retry loop
             } catch (err: any) {
-              const isRateLimit = err.message && err.message.includes('429');
-              const isUnavailable = err.message && (err.message.includes('503') || err.message.includes('UNAVAILABLE'));
-              const isLimited = isRateLimit || isUnavailable;
-
-              if (isLimited) {
+              if (err.message && err.message.includes('429')) {
                 retries--;
                 if (retries === 0) throw err;
-                setJobStatus({ status: 'running', progress: completed, total, message: `Serviço ocupado. Tentando de novo em ${delay / 1000}s... (${retries} tentativas restantes)` });
+                setJobStatus({ status: 'running', progress: completed, total, message: `Aguardando limite de requisições... (${retries} tentativas restantes)` });
                 await new Promise(resolve => setTimeout(resolve, delay));
                 delay *= 2; // Exponential backoff
               } else {
-                throw err; // Re-throw if it's not a rate limit / service unavailable error
+                throw err; // Re-throw if it's not a rate limit error
               }
             }
           }
@@ -305,13 +341,28 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
 
           let seoText = '';
           let metaDescription = '';
+          let rawText = response.text || '';
+          
           try {
-            const jsonResponse = JSON.parse(response.text || '{}');
+            const jsonResponse = JSON.parse(rawText);
             seoText = jsonResponse.seoText || '';
             metaDescription = jsonResponse.metaDescription || '';
           } catch (e) {
             console.error('Failed to parse JSON response', e);
-            seoText = response.text || '';
+            // Tenta extrair apenas o objeto JSON caso a API tenha retornado texto extra
+            try {
+              const match = rawText.match(/\{[\s\S]*\}/);
+              if (match) {
+                const jsonResponse = JSON.parse(match[0]);
+                seoText = jsonResponse.seoText || '';
+                metaDescription = jsonResponse.metaDescription || '';
+              } else {
+                seoText = rawText;
+              }
+            } catch (e2) {
+              console.error('Failed to parse extracted JSON', e2);
+              seoText = rawText;
+            }
           }
 
           // Clean up potential markdown blocks just in case
@@ -492,15 +543,15 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                     <Key className="w-5 h-5 text-indigo-500" />
                     Palavras-chave ({keywords.length})
                   </h3>
-                  <form onSubmit={addKeyword} className="flex gap-2 mb-4">
-                    <input
-                      type="text"
-                      placeholder="Ex: dentista invisalign"
-                      className="flex-1 px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                  <form onSubmit={addKeyword} className="flex flex-col gap-2 mb-4">
+                    <textarea
+                      placeholder="Ex: dentista invisalign (adicione várias separando por vírgula ou uma por linha)"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                      rows={3}
                       value={newKeyword}
                       onChange={(e) => setNewKeyword(e.target.value)}
                     />
-                    <button type="submit" className="px-3 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 border border-gray-300">
+                    <button type="submit" className="self-end px-4 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 border border-gray-300 text-sm font-medium">
                       Adicionar
                     </button>
                   </form>
@@ -520,15 +571,15 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                     <MapPin className="w-5 h-5 text-indigo-500" />
                     Regiões ({regions.length})
                   </h3>
-                  <form onSubmit={addRegion} className="flex gap-2 mb-4">
-                    <input
-                      type="text"
-                      placeholder="Ex: São Paulo, SP"
-                      className="flex-1 px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                  <form onSubmit={addRegion} className="flex flex-col gap-2 mb-4">
+                    <textarea
+                      placeholder="Ex: São Paulo, SP (adicione várias separando por vírgula ou uma por linha)"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                      rows={3}
                       value={newRegion}
                       onChange={(e) => setNewRegion(e.target.value)}
                     />
-                    <button type="submit" className="px-3 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 border border-gray-300">
+                    <button type="submit" className="self-end px-4 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 border border-gray-300 text-sm font-medium">
                       Adicionar
                     </button>
                   </form>
@@ -573,6 +624,12 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                     <p className="text-xs text-gray-500 mt-1">Você pode usar as tags {'{{KEYWORD}}'} e {'{{REGION}}'} aqui.</p>
                   </div>
                 </div>
+                <div className="flex justify-end mt-4">
+                  <button onClick={saveWhatsappConfig} className="px-4 py-2 bg-green-50 text-green-700 rounded-md hover:bg-green-100 font-medium text-sm border border-green-200 flex items-center gap-2">
+                    <Save className="w-4 h-4" />
+                    Salvar Configuração
+                  </button>
+                </div>
               </div>
 
               {/* Template */}
@@ -589,26 +646,28 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                           <FolderOpen className="w-4 h-4" />
                           Carregar Template
                         </button>
-                        <div className="absolute right-0 mt-1 w-64 bg-white border border-gray-200 rounded-md shadow-lg hidden group-hover:block z-10">
-                          <ul className="py-1 max-h-60 overflow-auto">
-                            {globalTemplates.map(gt => (
-                              <li key={gt.id} className="flex items-center justify-between px-4 py-2 hover:bg-gray-50">
-                                <button 
-                                  className="text-sm text-left flex-1 truncate text-gray-700"
-                                  onClick={() => loadGlobalTemplate(gt.content)}
-                                >
-                                  {gt.name}
-                                </button>
-                                <button 
-                                  onClick={() => deleteGlobalTemplate(gt.id)}
-                                  className="text-gray-400 hover:text-red-500 ml-2"
-                                  title="Excluir template"
-                                >
-                                  <Trash2 className="w-4 h-4" />
-                                </button>
-                              </li>
-                            ))}
-                          </ul>
+                        <div className="absolute right-0 top-full pt-1 w-64 hidden group-hover:block z-10">
+                          <div className="bg-white border border-gray-200 rounded-md shadow-lg">
+                            <ul className="py-1 max-h-60 overflow-auto">
+                              {globalTemplates.map(gt => (
+                                <li key={gt.id} className="flex items-center justify-between px-4 py-2 hover:bg-gray-50">
+                                  <button 
+                                    className="text-sm text-left flex-1 truncate text-gray-700"
+                                    onClick={() => loadGlobalTemplate(gt.content)}
+                                  >
+                                    {gt.name}
+                                  </button>
+                                  <button 
+                                    onClick={() => deleteGlobalTemplate(gt.id)}
+                                    className="text-gray-400 hover:text-red-500 ml-2"
+                                    title="Excluir template"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
                         </div>
                       </div>
                     )}
