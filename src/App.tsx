@@ -1,15 +1,14 @@
-import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, Download, Play, FileText, MapPin, Key, Users, Settings, Loader2, MessageCircle, Save, FolderOpen } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Plus, Trash2, Download, Play, Pause, FileText, MapPin, Key, Users, Settings, Loader2, MessageCircle, Save, FolderOpen } from 'lucide-react';
 import { GoogleGenAI, Type } from '@google/genai';
-import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 
 interface Client {
   id: number;
   name: string;
-  nome?: string; // Fallback para tabelas em PT-BR
+  nome?: string;
   context: string;
-  descricao?: string; // Fallback para tabelas em PT-BR
+  descricao?: string;
   whatsapp_number?: string;
   whatsapp_message?: string;
 }
@@ -28,6 +27,34 @@ interface GlobalTemplate {
   id: number;
   name: string;
   content: string;
+}
+
+interface GenerationItem {
+  index: number;
+  keyword: string;
+  region: string;
+  filename: string;
+}
+
+interface JobConfig {
+  template: string;
+  client_name: string;
+  client_context: string;
+  whatsapp_number: string;
+  whatsapp_message: string;
+}
+
+interface JobStatus {
+  id: string;
+  status: string;
+  progress: number;
+  total: number;
+  message: string;
+  downloadUrl: string;
+  zipFilename: string;
+  completedIndexes: number[];
+  items: GenerationItem[];
+  config: JobConfig;
 }
 
 const getApiBaseUrl = () => {
@@ -51,6 +78,20 @@ const getApiBaseUrl = () => {
 };
 
 const API_BASE_URL = getApiBaseUrl();
+const AUTO_PAUSE_BATCH_SIZE = 2498;
+const DEFAULT_TEMPLATE = `<!DOCTYPE html>
+<html>
+<head>
+  <title>{{TITLE}}</title>
+  <meta name="description" content="{{DESCRIPTION}}">
+</head>
+<body>
+  <main>
+    <h1>{{TITLE}}</h1>
+    {{SEO_TEXT}}
+  </main>
+</body>
+</html>`;
 
 const apiFetch = (path: string, init?: RequestInit) => {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
@@ -99,39 +140,79 @@ const parseApiError = async (response: Response, fallbackMessage: string) => {
   return text || fallbackMessage;
 };
 
+const slugify = (value: string) =>
+  value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '') || 'arquivo';
+
+const buildGenerationItems = (keywords: Keyword[], regions: Region[]) => {
+  const regionsToProcess = regions.length > 0 ? regions : [{ id: 0, region: '' }];
+  const items: GenerationItem[] = [];
+  let index = 0;
+
+  for (const kw of keywords) {
+    for (const reg of regionsToProcess) {
+      const safeKeyword = slugify(kw.keyword);
+      const safeRegion = reg.region ? slugify(reg.region) : '';
+
+      items.push({
+        index,
+        keyword: kw.keyword,
+        region: reg.region,
+        filename: safeRegion ? `${safeKeyword}-${safeRegion}.php` : `${safeKeyword}.php`,
+      });
+
+      index += 1;
+    }
+  }
+
+  return items;
+};
+
+const normalizeJobStatus = (job: any): JobStatus => ({
+  id: String(job.id),
+  status: String(job.status || 'paused'),
+  progress: Number(job.progress || job.generated_count || 0),
+  total: Number(job.total || 0),
+  message: String(job.message || ''),
+  downloadUrl: String(job.download_url || ''),
+  zipFilename: String(job.zip_filename || 'textos-seo.zip'),
+  completedIndexes: Array.isArray(job.completed_indexes) ? job.completed_indexes.map((value: any) => Number(value)) : [],
+  items: Array.isArray(job.items) ? job.items : [],
+  config: {
+    template: String(job.config?.template || ''),
+    client_name: String(job.config?.client_name || ''),
+    client_context: String(job.config?.client_context || ''),
+    whatsapp_number: String(job.config?.whatsapp_number || ''),
+    whatsapp_message: String(job.config?.whatsapp_message || ''),
+  },
+});
+
 export default function App() {
   const [clients, setClients] = useState<Client[]>([]);
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
-  
-  // Client Form
   const [newClientName, setNewClientName] = useState('');
   const [newClientContext, setNewClientContext] = useState('');
-
-  // Selected Client Data
   const [keywords, setKeywords] = useState<Keyword[]>([]);
   const [regions, setRegions] = useState<Region[]>([]);
   const [template, setTemplate] = useState('');
-  
-  // Input fields
   const [newKeyword, setNewKeyword] = useState('');
   const [newRegion, setNewRegion] = useState('');
-
-  // Job State
   const [isGenerating, setIsGenerating] = useState(false);
-  const [jobStatus, setJobStatus] = useState<{status: string, progress: number, total: number, message: string, zipBlob?: Blob} | null>(null);
-
-  // WhatsApp State
+  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [whatsappNumber, setWhatsappNumber] = useState('');
   const [whatsappMessage, setWhatsappMessage] = useState('');
-
-  // UI State
   const [clientToDelete, setClientToDelete] = useState<number | null>(null);
   const [toast, setToast] = useState<{message: string, type: 'success' | 'error'} | null>(null);
-
-  // Global Templates State
   const [globalTemplates, setGlobalTemplates] = useState<GlobalTemplate[]>([]);
   const [showSaveTemplateModal, setShowSaveTemplateModal] = useState(false);
   const [newTemplateName, setNewTemplateName] = useState('');
+  const [isContextExpanded, setIsContextExpanded] = useState(false);
+  const pauseRequestedRef = useRef(false);
+  const templateRequestRef = useRef(0);
 
   const showToast = (message: string, type: 'success' | 'error' = 'success') => {
     setToast({ message, type });
@@ -145,34 +226,40 @@ export default function App() {
 
   useEffect(() => {
     if (selectedClient) {
+      setTemplate('');
       fetchKeywords(selectedClient.id);
       fetchRegions(selectedClient.id);
       fetchTemplate(selectedClient.id);
+      fetchGenerationJob(selectedClient.id);
       setWhatsappNumber(selectedClient.whatsapp_number || '');
       setWhatsappMessage(selectedClient.whatsapp_message || '');
+      setIsContextExpanded(false);
+    } else {
+      setJobStatus(null);
+      setIsGenerating(false);
+      setIsContextExpanded(false);
     }
   }, [selectedClient]);
 
   const fetchClients = async () => {
     try {
       const res = await apiFetch('/clients');
-      
-      // Verifica se a resposta é JSON válido
-      const contentType = res.headers.get("content-type");
-      if (!contentType || !contentType.includes("application/json")) {
+      const contentType = res.headers.get('content-type');
+
+      if (!contentType || !contentType.includes('application/json')) {
         const text = await res.text();
-        console.error("Resposta não-JSON da API:", text);
-        throw new Error("A API retornou um erro HTML (provavelmente 404 ou 500). Verifique o console.");
+        console.error('Resposta não JSON da API:', text);
+        throw new Error('A API retornou um erro HTML. Verifique o console.');
       }
 
       const data = await res.json();
-      
-      if (!res.ok) throw new Error(data.error || 'Erro na API');
-      
-      console.log("Clientes carregados:", data); // LOG PARA DEBUG
+      if (!res.ok) {
+        throw new Error(data.error || 'Erro na API');
+      }
+
       setClients(data);
     } catch (error: any) {
-      console.error("Erro no fetchClients:", error);
+      console.error('Erro no fetchClients:', error);
       showToast(error.message || 'Erro ao conectar com o servidor.', 'error');
     }
   };
@@ -186,6 +273,7 @@ export default function App() {
   const addClient = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newClientName) return;
+
     try {
       const res = await apiFetch('/clients', {
         method: 'POST',
@@ -193,8 +281,11 @@ export default function App() {
         body: JSON.stringify({ name: newClientName, context: newClientContext })
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Erro ao criar cliente');
-      
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Erro ao criar cliente');
+      }
+
       setNewClientName('');
       setNewClientContext('');
       fetchClients();
@@ -206,7 +297,9 @@ export default function App() {
 
   const deleteClient = async (id: number) => {
     await apiFetch(`/clients/${id}`, { method: 'DELETE' });
-    if (selectedClient?.id === id) setSelectedClient(null);
+    if (selectedClient?.id === id) {
+      setSelectedClient(null);
+    }
     setClientToDelete(null);
     fetchClients();
     showToast('Cliente excluído com sucesso.');
@@ -220,16 +313,20 @@ export default function App() {
   const addKeyword = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newKeyword.trim() || !selectedClient) return;
-    
-    const keywordsArray = newKeyword.split(/[\n,]+/).map(k => k.trim()).filter(k => k);
-    
+
+    const keywordsArray = newKeyword.split(/[\n,]+/).map(k => k.trim()).filter(Boolean);
+
     try {
       const res = await apiFetch(`/clients/${selectedClient.id}/keywords/bulk`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ keywords: keywordsArray })
       });
-      if (!res.ok) throw new Error(await parseApiError(res, 'Erro ao salvar palavras-chave'));
+
+      if (!res.ok) {
+        throw new Error(await parseApiError(res, 'Erro ao salvar palavras-chave'));
+      }
+
       setNewKeyword('');
       fetchKeywords(selectedClient.id);
     } catch (error: any) {
@@ -239,7 +336,18 @@ export default function App() {
 
   const deleteKeyword = async (id: number) => {
     await apiFetch(`/keywords/${id}`, { method: 'DELETE' });
-    if (selectedClient) fetchKeywords(selectedClient.id);
+    if (selectedClient) {
+      fetchKeywords(selectedClient.id);
+    }
+  };
+
+  const deleteAllKeywords = async () => {
+    if (!selectedClient || keywords.length === 0) return;
+    if (!confirm('Tem certeza que deseja apagar todas as palavras-chave deste cliente?')) return;
+
+    await apiFetch(`/clients/${selectedClient.id}/keywords`, { method: 'DELETE' });
+    fetchKeywords(selectedClient.id);
+    showToast('Todas as palavras-chave foram apagadas.');
   };
 
   const fetchRegions = async (clientId: number) => {
@@ -250,16 +358,20 @@ export default function App() {
   const addRegion = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newRegion.trim() || !selectedClient) return;
-    
-    const regionsArray = newRegion.split(/[\n,]+/).map(r => r.trim()).filter(r => r);
-    
+
+    const regionsArray = newRegion.split(/[\n,]+/).map(r => r.trim()).filter(Boolean);
+
     try {
       const res = await apiFetch(`/clients/${selectedClient.id}/regions/bulk`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ regions: regionsArray })
       });
-      if (!res.ok) throw new Error('Erro ao salvar regiões');
+
+      if (!res.ok) {
+        throw new Error('Erro ao salvar regiões');
+      }
+
       setNewRegion('');
       fetchRegions(selectedClient.id);
     } catch (error: any) {
@@ -269,56 +381,96 @@ export default function App() {
 
   const deleteRegion = async (id: number) => {
     await apiFetch(`/regions/${id}`, { method: 'DELETE' });
-    if (selectedClient) fetchRegions(selectedClient.id);
+    if (selectedClient) {
+      fetchRegions(selectedClient.id);
+    }
+  };
+
+  const deleteAllRegions = async () => {
+    if (!selectedClient || regions.length === 0) return;
+    if (!confirm('Tem certeza que deseja apagar todas as regiões deste cliente?')) return;
+
+    await apiFetch(`/clients/${selectedClient.id}/regions`, { method: 'DELETE' });
+    fetchRegions(selectedClient.id);
+    showToast('Todas as regiões foram apagadas.');
   };
 
   const fetchTemplate = async (clientId: number) => {
+    const requestId = ++templateRequestRef.current;
     const res = await apiFetch(`/clients/${clientId}/template`);
     const data = await res.json();
-    setTemplate(data.content || `<!DOCTYPE html>
-<html>
-<head>
-  <title>{{TITLE}}</title>
-  <meta name="description" content="{{DESCRIPTION}}">
-</head>
-<body>
-  <main>
-    <h1>{{TITLE}}</h1>
-    {{SEO_TEXT}}
-  </main>
-</body>
-</html>`);
+
+    if (templateRequestRef.current !== requestId || selectedClient?.id !== clientId) {
+      return;
+    }
+
+    setTemplate(data.content || DEFAULT_TEMPLATE);
+  };
+
+  const fetchGenerationJob = async (clientId: number) => {
+    try {
+      const res = await apiFetch(`/clients/${clientId}/generation-job`);
+      if (!res.ok) {
+        throw new Error(await parseApiError(res, 'Erro ao buscar o job de geração'));
+      }
+
+      const data = await res.json();
+      if (!data?.id) {
+        setJobStatus(null);
+        return;
+      }
+
+      setJobStatus(normalizeJobStatus(data));
+    } catch (error) {
+      console.error('Erro ao buscar job:', error);
+    }
+  };
+
+  const updateJobStatus = (job: any) => {
+    const normalized = normalizeJobStatus(job);
+    setJobStatus(normalized);
+    return normalized;
   };
 
   const saveWhatsappConfig = async () => {
     if (!selectedClient) return;
+
     await apiFetch(`/clients/${selectedClient.id}/whatsapp`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ whatsapp_number: whatsappNumber, whatsapp_message: whatsappMessage })
     });
-    
-    // Update local state so it persists if we switch clients and come back
+
     const updatedClient = { ...selectedClient, whatsapp_number: whatsappNumber, whatsapp_message: whatsappMessage };
     setSelectedClient(updatedClient);
     setClients(clients.map(c => c.id === selectedClient.id ? updatedClient : c));
-    
     showToast('Configuração do WhatsApp salva com sucesso!');
   };
 
   const saveTemplate = async () => {
     if (!selectedClient) return;
-    await apiFetch(`/clients/${selectedClient.id}/template`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: template })
-    });
-    showToast('Template salvo para este cliente com sucesso!');
+
+    try {
+      const res = await apiFetch(`/clients/${selectedClient.id}/template`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: template })
+      });
+
+      if (!res.ok) {
+        throw new Error(await parseApiError(res, 'Erro ao salvar template do cliente'));
+      }
+
+      showToast('Template salvo para este cliente com sucesso!');
+    } catch (error: any) {
+      showToast(error.message || 'Erro ao salvar template do cliente', 'error');
+    }
   };
 
   const saveGlobalTemplate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newTemplateName.trim() || !template.trim()) return;
+
     try {
       const res = await apiFetch('/global-templates', {
         method: 'POST',
@@ -326,7 +478,10 @@ export default function App() {
         body: JSON.stringify({ name: newTemplateName, content: template })
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Erro ao salvar template');
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Erro ao salvar template');
+      }
 
       setNewTemplateName('');
       setShowSaveTemplateModal(false);
@@ -349,49 +504,12 @@ export default function App() {
     showToast('Template carregado com sucesso!');
   };
 
-  const generateTexts = async () => {
-    if (!selectedClient) return;
-    if (keywords.length === 0) {
-      showToast('Por favor, adicione pelo menos uma palavra-chave antes de gerar.', 'error');
-      return;
-    }
-    if (!template.trim()) {
-      showToast('O template não pode estar vazio.', 'error');
-      return;
-    }
-    
-    // Auto-save template before generating
-    await apiFetch(`/clients/${selectedClient.id}/template`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: template })
-    });
+  const buildPrompt = (clientName: string, clientContext: string, keyword: string, region: string) => {
+    const regionText = region ? ` em ${region}` : '';
+    const regionPromptText = region ? ` na região de '${region}'` : '';
 
-    setJobStatus(null);
-    setIsGenerating(true);
-
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const regionsToProcess = regions.length > 0 ? regions : [{ id: 0, region: '' }];
-      const total = keywords.length * regionsToProcess.length;
-      let completed = 0;
-      
-      setJobStatus({ status: 'running', progress: 0, total, message: 'Iniciando...' });
-      
-      const zip = new JSZip();
-
-      for (const kw of keywords) {
-        for (const reg of regionsToProcess) {
-          const keyword = kw.keyword;
-          const region = reg.region;
-          
-          const regionText = region ? ` em ${region}` : '';
-          const regionPromptText = region ? ` na região de '${region}'` : '';
-          
-          setJobStatus({ status: 'running', progress: completed, total, message: `Gerando: ${keyword}${regionText}...` });
-
-          const prompt = `Você é um Especialista Sênior em SEO e Copywriting. Sua tarefa é escrever um texto completo, longo e altamente otimizado para SEO sobre '${keyword}'${regionPromptText}.
-O cliente é '${selectedClient.name}'. Informações adicionais sobre o cliente/serviço: '${selectedClient.context}'.
+    return `Você é um Especialista Sênior em SEO e Copywriting. Sua tarefa é escrever um texto completo, longo e altamente otimizado para SEO sobre '${keyword}'${regionPromptText}.
+O cliente é '${clientName}'. Informações adicionais sobre o cliente/serviço: '${clientContext}'.
 
 DIRETRIZES DE SEO E SEMÂNTICA (MUITO IMPORTANTE):
 1. Estrutura Completa: O texto deve ser aprofundado, persuasivo e cobrir o assunto de ponta a ponta para garantir a melhor performance de ranqueamento no Google.
@@ -404,143 +522,317 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
   "metaDescription": "Uma meta description persuasiva e otimizada para SEO, contendo a palavra-chave${region ? ' e a região' : ''}, com no máximo 160 caracteres.",
   "seoText": "O código HTML puro do texto completo, sem as tags <html>, <head> ou <body>."
 }`;
+  };
 
-          let response;
-          let retries = 5;
-          let delay = 5000;
+  const buildFileContent = (
+    config: JobConfig,
+    keyword: string,
+    region: string,
+    seoText: string,
+    metaDescription: string,
+  ) => {
+    const regionText = region ? ` em ${region}` : '';
+    const title = `${keyword}${regionText}`;
+    const cleanNumber = config.whatsapp_number.replace(/\D/g, '');
+    const encodedMessage = encodeURIComponent(
+      config.whatsapp_message
+        .replace(/\{\{KEYWORD\}\}/g, keyword)
+        .replace(/\{\{REGION\}\}/g, region),
+    );
+    const whatsappLink = cleanNumber ? `https://wa.me/${cleanNumber}${encodedMessage ? `?text=${encodedMessage}` : ''}` : '#';
 
-          while (retries > 0) {
-            try {
-              response = await ai.models.generateContent({
-                model: 'gemini-3-flash-preview',
-                contents: prompt,
-                config: {
-                  responseMimeType: 'application/json',
-                  responseSchema: {
-                    type: Type.OBJECT,
-                    properties: {
-                      metaDescription: {
-                        type: Type.STRING,
-                        description: "Uma meta description persuasiva e otimizada para SEO, contendo a palavra-chave, com no máximo 160 caracteres."
-                      },
-                      seoText: {
-                        type: Type.STRING,
-                        description: "O código HTML puro do texto completo, sem as tags <html>, <head> ou <body>."
-                      }
-                    },
-                    required: ["metaDescription", "seoText"]
+    let fileContent = config.template;
+    fileContent = fileContent.replace(/\{\{SEO_TEXT\}\}/g, seoText);
+    fileContent = fileContent.replace(/\{\{TITLE\}\}/g, title);
+    fileContent = fileContent.replace(/\{\{DESCRIPTION\}\}/g, metaDescription);
+    fileContent = fileContent.replace(/\{\{KEYWORD\}\}/g, keyword);
+    fileContent = fileContent.replace(/\{\{REGION\}\}/g, region);
+    fileContent = fileContent.replace(/\{\{COMPANY_NAME\}\}/g, config.client_name);
+    fileContent = fileContent.replace(/\{\{WHATSAPP_LINK\}\}/g, whatsappLink);
+
+    return fileContent;
+  };
+
+  const downloadCurrentZip = async (currentJob?: JobStatus | null) => {
+    const job = currentJob || jobStatus;
+
+    if (!job?.downloadUrl) {
+      showToast('Nenhum ZIP disponível para download ainda.', 'error');
+      return;
+    }
+
+    const relativeUrl = job.downloadUrl.startsWith('/api')
+      ? job.downloadUrl.replace(/^\/api/, '')
+      : job.downloadUrl;
+
+    try {
+      const res = await apiFetch(relativeUrl);
+      if (!res.ok) {
+        throw new Error(await parseApiError(res, 'Erro ao baixar o ZIP'));
+      }
+
+      const blob = await res.blob();
+      saveAs(blob, job.zipFilename || 'textos-seo.zip');
+    } catch (error: any) {
+      showToast(error.message || 'Erro ao baixar ZIP.', 'error');
+    }
+  };
+
+  const requestPause = () => {
+    if (!isGenerating || !jobStatus?.id) return;
+
+    pauseRequestedRef.current = true;
+    setJobStatus(current => current ? {
+      ...current,
+      message: 'Pausando após concluir o item atual...'
+    } : current);
+  };
+
+  const processGeneration = async (initialJob: JobStatus) => {
+    const apiKey =
+      (import.meta as any).env?.VITE_GEMINI_API_KEY ||
+      (typeof process !== 'undefined' ? (process as any).env?.GEMINI_API_KEY : '');
+
+    if (!apiKey) {
+      throw new Error('A chave do Gemini não está configurada.');
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const completedIndexes = new Set(initialJob.completedIndexes);
+
+    for (const item of initialJob.items) {
+      if (completedIndexes.has(item.index)) {
+        continue;
+      }
+
+      setJobStatus(current => current ? {
+        ...current,
+        status: 'running',
+        message: `Gerando: ${item.keyword}${item.region ? ` em ${item.region}` : ''}...`
+      } : current);
+
+      const prompt = buildPrompt(initialJob.config.client_name, initialJob.config.client_context, item.keyword, item.region);
+      let response: any;
+      let retries = 5;
+      let delay = 5000;
+
+      while (retries > 0) {
+        try {
+          response = await ai.models.generateContent({
+            model: 'gemini-3-flash-preview',
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  metaDescription: {
+                    type: Type.STRING,
+                    description: 'Uma meta description persuasiva e otimizada para SEO, contendo a palavra-chave, com no máximo 160 caracteres.'
+                  },
+                  seoText: {
+                    type: Type.STRING,
+                    description: 'O código HTML puro do texto completo, sem as tags <html>, <head> ou <body>.'
                   }
-                }
-              });
-              break; // Success, exit retry loop
-            } catch (err: any) {
-              const errorMessage = getErrorMessage(err);
-
-              if (isRetryableGenerationError(errorMessage)) {
-                retries--;
-
-                if (retries === 0) {
-                  throw new Error(`A API do Gemini está temporariamente indisponível ou sobrecarregada. Tente novamente em alguns minutos. Detalhe: ${errorMessage}`);
-                }
-
-                setJobStatus({
-                  status: 'running',
-                  progress: completed,
-                  total,
-                  message: `Gemini indisponível no momento. Nova tentativa em ${Math.ceil(delay / 1000)}s (${retries} restantes)...`
-                });
-
-                await sleep(delay);
-                delay *= 2;
-              } else {
-                throw err;
+                },
+                required: ['metaDescription', 'seoText']
               }
             }
-          }
+          });
+          break;
+        } catch (err: any) {
+          const errorMessage = getErrorMessage(err);
 
-          // Add a small delay to avoid rate limits
-          await sleep(3000);
+          if (isRetryableGenerationError(errorMessage)) {
+            retries -= 1;
 
-          let seoText = '';
-          let metaDescription = '';
-          let rawText = response.text || '';
-          
-          try {
-            const jsonResponse = JSON.parse(rawText);
-            seoText = jsonResponse.seoText || '';
-            metaDescription = jsonResponse.metaDescription || '';
-          } catch (e) {
-            console.error('Failed to parse JSON response', e);
-            // Tenta extrair apenas o objeto JSON caso a API tenha retornado texto extra
-            try {
-              const match = rawText.match(/\{[\s\S]*\}/);
-              if (match) {
-                const jsonResponse = JSON.parse(match[0]);
-                seoText = jsonResponse.seoText || '';
-                metaDescription = jsonResponse.metaDescription || '';
-              } else {
-                seoText = rawText;
-              }
-            } catch (e2) {
-              console.error('Failed to parse extracted JSON', e2);
-              seoText = rawText;
+            if (retries === 0) {
+              throw new Error(`A API do Gemini está temporariamente indisponível ou sobrecarregada. Tente novamente em alguns minutos. Detalhe: ${errorMessage}`);
             }
+
+            setJobStatus(current => current ? {
+              ...current,
+              message: `Gemini indisponível no momento. Nova tentativa em ${Math.ceil(delay / 1000)}s (${retries} restantes)...`
+            } : current);
+
+            await sleep(delay);
+            delay *= 2;
+          } else {
+            throw err;
           }
-
-          // Clean up potential markdown blocks just in case
-          seoText = seoText.replace(/^```html\n?/m, '').replace(/^```\n?/m, '').replace(/```$/m, '').trim();
-
-          const title = `${keyword}${regionText}`;
-          const companyName = selectedClient.name || selectedClient.nome || '';
-          
-          // Generate WhatsApp Link
-          const cleanNumber = whatsappNumber.replace(/\D/g, '');
-          const encodedMessage = encodeURIComponent(whatsappMessage.replace(/\{\{KEYWORD\}\}/g, keyword).replace(/\{\{REGION\}\}/g, region));
-          const whatsappLink = cleanNumber ? `https://wa.me/${cleanNumber}${encodedMessage ? `?text=${encodedMessage}` : ''}` : '#';
-
-          let fileContent = template;
-          fileContent = fileContent.replace(/\{\{SEO_TEXT\}\}/g, seoText);
-          fileContent = fileContent.replace(/\{\{TITLE\}\}/g, title);
-          fileContent = fileContent.replace(/\{\{DESCRIPTION\}\}/g, metaDescription);
-          fileContent = fileContent.replace(/\{\{KEYWORD\}\}/g, keyword);
-          fileContent = fileContent.replace(/\{\{REGION\}\}/g, region);
-          fileContent = fileContent.replace(/\{\{COMPANY_NAME\}\}/g, companyName);
-          fileContent = fileContent.replace(/\{\{WHATSAPP_LINK\}\}/g, whatsappLink);
-
-          // Create filename: keyword-region.php or keyword.php
-          const safeKeyword = keyword.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-          const safeRegion = region ? region.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') : '';
-          const filename = safeRegion ? `${safeKeyword}-${safeRegion}.php` : `${safeKeyword}.php`;
-
-          zip.file(filename, fileContent);
-          
-          completed++;
         }
       }
 
-      setJobStatus({ status: 'running', progress: completed, total, message: 'Finalizando arquivo ZIP...' });
-      
-      const content = await zip.generateAsync({ type: 'blob' });
-      
-      setJobStatus({ status: 'completed', progress: completed, total, message: 'Concluído!', zipBlob: content });
-      setIsGenerating(false);
+      await sleep(3000);
 
+      let seoText = '';
+      let metaDescription = '';
+      const rawText = response?.text || '';
+
+      try {
+        const parsed = JSON.parse(rawText);
+        seoText = parsed.seoText || '';
+        metaDescription = parsed.metaDescription || '';
+      } catch {
+        try {
+          const match = rawText.match(/\{[\s\S]*\}/);
+          if (match) {
+            const parsed = JSON.parse(match[0]);
+            seoText = parsed.seoText || '';
+            metaDescription = parsed.metaDescription || '';
+          } else {
+            seoText = rawText;
+          }
+        } catch {
+          seoText = rawText;
+        }
+      }
+
+      seoText = seoText.replace(/^```html\n?/m, '').replace(/^```\n?/m, '').replace(/```$/m, '').trim();
+
+      const fileContent = buildFileContent(
+        initialJob.config,
+        item.keyword,
+        item.region,
+        seoText,
+        metaDescription,
+      );
+
+      const saveRes = await apiFetch(`/jobs/${initialJob.id}/files`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          index: item.index,
+          filename: item.filename,
+          content: fileContent,
+        })
+      });
+
+      if (!saveRes.ok) {
+        throw new Error(await parseApiError(saveRes, 'Erro ao salvar o arquivo gerado'));
+      }
+
+      const savedJob = updateJobStatus(await saveRes.json());
+      completedIndexes.add(item.index);
+      const shouldAutoPause =
+        savedJob.progress > 0 &&
+        savedJob.progress < savedJob.total &&
+        savedJob.progress % AUTO_PAUSE_BATCH_SIZE === 0;
+
+      if (pauseRequestedRef.current || shouldAutoPause) {
+        const pauseRes = await apiFetch(`/jobs/${initialJob.id}/pause`, { method: 'POST' });
+        if (!pauseRes.ok) {
+          throw new Error(await parseApiError(pauseRes, 'Erro ao pausar a geração'));
+        }
+
+        const pausedJob = updateJobStatus(await pauseRes.json());
+        pauseRequestedRef.current = false;
+        setIsGenerating(false);
+        if (shouldAutoPause) {
+          setJobStatus(current => current ? {
+            ...current,
+            message: `Pausa automática ao atingir ${pausedJob.progress} arquivos.`
+          } : current);
+          showToast(`Pausa automática aplicada ao atingir ${pausedJob.progress} arquivos.`);
+        } else {
+          await downloadCurrentZip(pausedJob);
+        }
+        showToast(`Geração pausada com ${pausedJob.progress} arquivo(s) já no ZIP.`);
+        return;
+      }
+
+      if (savedJob.progress >= savedJob.total) {
+        const completeRes = await apiFetch(`/jobs/${initialJob.id}/complete`, { method: 'POST' });
+        if (!completeRes.ok) {
+          throw new Error(await parseApiError(completeRes, 'Erro ao finalizar a geração'));
+        }
+
+        updateJobStatus(await completeRes.json());
+        setIsGenerating(false);
+        showToast('Geração concluída com sucesso!');
+        return;
+      }
+    }
+
+    setIsGenerating(false);
+  };
+
+  const generateTexts = async () => {
+    if (!selectedClient) return;
+
+    if (keywords.length === 0) {
+      showToast('Por favor, adicione pelo menos uma palavra-chave antes de gerar.', 'error');
+      return;
+    }
+
+    if (!template.trim()) {
+      showToast('O template não pode estar vazio.', 'error');
+      return;
+    }
+
+    let currentJob: JobStatus | null = null;
+
+    try {
+      pauseRequestedRef.current = false;
+
+      const saveTemplateResponse = await apiFetch(`/clients/${selectedClient.id}/template`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: template })
+      });
+
+      if (!saveTemplateResponse.ok) {
+        throw new Error(await parseApiError(saveTemplateResponse, 'Erro ao salvar template antes da geração'));
+      }
+
+      const response = await apiFetch(`/clients/${selectedClient.id}/generation-job`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          template,
+          client_name: selectedClient.name || selectedClient.nome || '',
+          client_context: selectedClient.context || selectedClient.descricao || '',
+          whatsapp_number: whatsappNumber,
+          whatsapp_message: whatsappMessage,
+          items: buildGenerationItems(keywords, regions),
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(await parseApiError(response, 'Erro ao iniciar a geração'));
+      }
+
+      currentJob = updateJobStatus(await response.json());
+      setIsGenerating(true);
+      await processGeneration(currentJob);
     } catch (error: any) {
       console.error('Generation error:', error);
-      setJobStatus({ status: 'error', progress: 0, total: 0, message: error.message || 'Erro desconhecido' });
+
+      if (currentJob?.id) {
+        await apiFetch(`/jobs/${currentJob.id}/error`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: error.message || 'Erro desconhecido' })
+        }).catch(() => null);
+      }
+
+      setJobStatus(current => current ? {
+        ...current,
+        status: 'error',
+        message: error.message || 'Erro desconhecido'
+      } : current);
       setIsGenerating(false);
+      showToast(error.message || 'Erro desconhecido', 'error');
     }
   };
 
-  const downloadZip = () => {
-    if (jobStatus?.zipBlob) {
-      saveAs(jobStatus.zipBlob, 'textos-seo.zip');
-    }
-  };
+  const canResume = !!jobStatus && jobStatus.progress > 0 && jobStatus.progress < jobStatus.total && !isGenerating;
+  const canDownloadPartial = !!jobStatus && jobStatus.progress > 0;
+  const generationCount = keywords.length * (regions.length > 0 ? regions.length : 1);
+  const progressPercent = jobStatus?.total ? (jobStatus.progress / jobStatus.total) * 100 : 0;
 
   return (
     <div className="flex h-screen bg-gray-50 text-gray-900 font-sans relative">
-      {/* Save Template Modal */}
       {showSaveTemplateModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white rounded-xl p-6 w-full max-w-md shadow-xl">
@@ -558,14 +850,14 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                 />
               </div>
               <div className="flex justify-end gap-3">
-                <button 
-                  type="button" 
+                <button
+                  type="button"
                   onClick={() => setShowSaveTemplateModal(false)}
                   className="px-4 py-2 bg-white text-gray-700 rounded-md hover:bg-gray-50 border border-gray-300 font-medium text-sm"
                 >
                   Cancelar
                 </button>
-                <button 
+                <button
                   type="submit"
                   className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 font-medium text-sm"
                 >
@@ -577,14 +869,12 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
         </div>
       )}
 
-      {/* Toast Notification */}
       {toast && (
         <div className={`absolute top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg text-sm font-medium transition-all ${toast.type === 'error' ? 'bg-red-100 text-red-800 border border-red-200' : 'bg-green-100 text-green-800 border border-green-200'}`}>
           {toast.message}
         </div>
       )}
 
-      {/* Sidebar */}
       <div className="w-80 bg-white border-r border-gray-200 flex flex-col h-full">
         <div className="p-6 border-b border-gray-200">
           <h1 className="text-xl font-bold flex items-center gap-2 text-indigo-600">
@@ -592,7 +882,7 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
             SEO Generator
           </h1>
         </div>
-        
+
         <div className="p-4 border-b border-gray-200 bg-gray-50">
           <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">Novo Cliente</h2>
           <form onSubmit={addClient} className="space-y-3">
@@ -623,19 +913,18 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
               <li key={client.id} className={`flex items-center justify-between p-3 rounded-lg cursor-pointer transition-colors ${selectedClient?.id === client.id ? 'bg-indigo-50 border border-indigo-200' : 'hover:bg-gray-100 border border-transparent'}`} onClick={() => setSelectedClient(client)}>
                 <div className="flex items-center gap-3 overflow-hidden">
                   <Users className={`w-5 h-5 flex-shrink-0 ${selectedClient?.id === client.id ? 'text-indigo-600' : 'text-gray-400'}`} />
-                  <span className="truncate font-medium">{client.name || client.nome || "Sem Nome"}</span>
+                  <span className="truncate font-medium">{client.name || client.nome || 'Sem Nome'}</span>
                 </div>
-                <button 
-                  onClick={(e) => { 
-                    e.stopPropagation(); 
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
                     if (clientToDelete === client.id) {
                       deleteClient(client.id);
                     } else {
                       setClientToDelete(client.id);
-                      // Auto-cancel after 3 seconds
                       setTimeout(() => setClientToDelete(null), 3000);
                     }
-                  }} 
+                  }}
                   className={`p-1 transition-colors ${clientToDelete === client.id ? 'text-red-600 font-bold text-xs bg-red-50 rounded px-2' : 'text-gray-400 hover:text-red-500'}`}
                 >
                   {clientToDelete === client.id ? 'Excluir?' : <Trash2 className="w-4 h-4" />}
@@ -649,24 +938,44 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
         </div>
       </div>
 
-      {/* Main Content */}
       <div className="flex-1 flex flex-col h-full overflow-hidden">
         {selectedClient ? (
           <>
             <div className="p-6 border-b border-gray-200 bg-white">
               <h2 className="text-2xl font-bold text-gray-900">{selectedClient.name || selectedClient.nome}</h2>
-              <p className="text-gray-500 mt-1">{selectedClient.context || selectedClient.descricao || 'Sem contexto adicional.'}</p>
+              <div className="mt-1">
+                <p className={`text-gray-500 ${isContextExpanded ? '' : 'truncate'}`}>
+                  {selectedClient.context || selectedClient.descricao || 'Sem contexto adicional.'}
+                </p>
+                {(selectedClient.context || selectedClient.descricao) && (
+                  <button
+                    type="button"
+                    onClick={() => setIsContextExpanded(current => !current)}
+                    className="mt-2 text-sm font-medium text-indigo-600 hover:text-indigo-700"
+                  >
+                    {isContextExpanded ? 'Recolher' : 'Expandir'}
+                  </button>
+                )}
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto p-6">
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-                
-                {/* Keywords */}
                 <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-200">
-                  <h3 className="text-lg font-medium flex items-center gap-2 mb-4">
-                    <Key className="w-5 h-5 text-indigo-500" />
-                    Palavras-chave ({keywords.length})
-                  </h3>
+                  <div className="flex items-center justify-between gap-3 mb-4">
+                    <h3 className="text-lg font-medium flex items-center gap-2">
+                      <Key className="w-5 h-5 text-indigo-500" />
+                      Palavras-chave ({keywords.length})
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={deleteAllKeywords}
+                      disabled={keywords.length === 0}
+                      className="px-3 py-2 text-sm font-medium text-red-600 bg-red-50 border border-red-200 rounded-md hover:bg-red-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Apagar Todas
+                    </button>
+                  </div>
                   <form onSubmit={addKeyword} className="flex flex-col gap-2 mb-4">
                     <textarea
                       placeholder="Ex: dentista invisalign (adicione várias separando por vírgula ou uma por linha)"
@@ -689,12 +998,21 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                   </ul>
                 </div>
 
-                {/* Regions */}
                 <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-200">
-                  <h3 className="text-lg font-medium flex items-center gap-2 mb-4">
-                    <MapPin className="w-5 h-5 text-indigo-500" />
-                    Regiões ({regions.length})
-                  </h3>
+                  <div className="flex items-center justify-between gap-3 mb-4">
+                    <h3 className="text-lg font-medium flex items-center gap-2">
+                      <MapPin className="w-5 h-5 text-indigo-500" />
+                      Regiões ({regions.length})
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={deleteAllRegions}
+                      disabled={regions.length === 0}
+                      className="px-3 py-2 text-sm font-medium text-red-600 bg-red-50 border border-red-200 rounded-md hover:bg-red-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Apagar Todas
+                    </button>
+                  </div>
                   <form onSubmit={addRegion} className="flex flex-col gap-2 mb-4">
                     <textarea
                       placeholder="Ex: São Paulo, SP (adicione várias separando por vírgula ou uma por linha)"
@@ -717,8 +1035,6 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                   </ul>
                 </div>
               </div>
-
-              {/* WhatsApp Config */}
               <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-200 mb-6">
                 <h3 className="text-lg font-medium flex items-center gap-2 mb-4">
                   <MessageCircle className="w-5 h-5 text-green-500" />
@@ -756,7 +1072,6 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                 </div>
               </div>
 
-              {/* Template */}
               <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-200 mb-6">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-4 gap-4">
                   <h3 className="text-lg font-medium flex items-center gap-2">
@@ -775,17 +1090,10 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                             <ul className="py-1 max-h-60 overflow-auto">
                               {globalTemplates.map(gt => (
                                 <li key={gt.id} className="flex items-center justify-between px-4 py-2 hover:bg-gray-50">
-                                  <button 
-                                    className="text-sm text-left flex-1 truncate text-gray-700"
-                                    onClick={() => loadGlobalTemplate(gt.content)}
-                                  >
+                                  <button className="text-sm text-left flex-1 truncate text-gray-700" onClick={() => loadGlobalTemplate(gt.content)}>
                                     {gt.name}
                                   </button>
-                                  <button 
-                                    onClick={() => deleteGlobalTemplate(gt.id)}
-                                    className="text-gray-400 hover:text-red-500 ml-2"
-                                    title="Excluir template"
-                                  >
+                                  <button onClick={() => deleteGlobalTemplate(gt.id)} className="text-gray-400 hover:text-red-500 ml-2" title="Excluir template">
                                     <Trash2 className="w-4 h-4" />
                                   </button>
                                 </li>
@@ -805,7 +1113,7 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                   </div>
                 </div>
                 <p className="text-sm text-gray-500 mb-3">
-                  Use as tags <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{SEO_TEXT}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{TITLE}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{DESCRIPTION}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{KEYWORD}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{REGION}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{COMPANY_NAME}}"}</code> e <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{WHATSAPP_LINK}}"}</code>.
+                  Use as tags <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{'{{SEO_TEXT}}'}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{'{{TITLE}}'}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{'{{DESCRIPTION}}'}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{'{{KEYWORD}}'}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{'{{REGION}}'}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{'{{COMPANY_NAME}}'}</code> e <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{'{{WHATSAPP_LINK}}'}</code>.
                 </p>
                 <textarea
                   className="w-full h-64 font-mono text-sm p-4 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
@@ -815,59 +1123,87 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                 />
               </div>
 
-              {/* Generator Action */}
               <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col items-center justify-center text-center">
                 <h3 className="text-xl font-bold mb-2">Gerar Textos SEO</h3>
                 <p className="text-gray-500 mb-6 max-w-lg">
-                  Serão gerados <strong>{keywords.length * (regions.length > 0 ? regions.length : 1)}</strong> arquivos PHP {regions.length > 0 ? 'combinando cada palavra-chave com cada região' : 'para cada palavra-chave'} usando a API do Gemini.
+                  Serão gerados <strong>{generationCount}</strong> arquivos PHP {regions.length > 0 ? 'combinando cada palavra-chave com cada região' : 'para cada palavra-chave'} usando a API do Gemini.
                 </p>
-                
-                {(!jobStatus || jobStatus.status === 'error') && !isGenerating && (
-                  <button 
-                    onClick={generateTexts}
-                    className="flex items-center gap-2 px-8 py-3 bg-indigo-600 text-white rounded-full font-medium hover:bg-indigo-700 shadow-md hover:shadow-lg transition-all"
-                  >
-                    <Play className="w-5 h-5" />
-                    Iniciar Geração
-                  </button>
-                )}
 
-                {jobStatus && jobStatus.status === 'error' && (
-                  <div className="mt-4 p-4 bg-red-50 text-red-700 rounded-lg border border-red-200 w-full max-w-lg">
-                    <p className="font-medium">Erro na geração:</p>
-                    <p className="text-sm">{jobStatus.message}</p>
+                {!isGenerating && (
+                  <div className="flex flex-wrap items-center justify-center gap-3">
+                    <button
+                      onClick={generateTexts}
+                      className="flex items-center gap-2 px-8 py-3 bg-indigo-600 text-white rounded-full font-medium hover:bg-indigo-700 shadow-md hover:shadow-lg transition-all"
+                    >
+                      <Play className="w-5 h-5" />
+                      {canResume ? 'Retomar Geração' : 'Iniciar Geração'}
+                    </button>
+
+                    {canDownloadPartial && (
+                      <button
+                        onClick={() => downloadCurrentZip()}
+                        className="flex items-center gap-2 px-6 py-3 bg-white text-gray-700 rounded-full font-medium hover:bg-gray-50 border border-gray-300 shadow-sm transition-all"
+                      >
+                        <Download className="w-5 h-5" />
+                        Baixar ZIP Atual
+                      </button>
+                    )}
                   </div>
                 )}
-
-                {jobStatus && jobStatus.status === 'running' && (
+                {jobStatus && (
                   <div className="mt-6 w-full max-w-lg">
                     <div className="flex justify-between text-sm font-medium mb-2">
-                      <span className="text-indigo-600 flex items-center gap-2">
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        {jobStatus.message}
+                      <span className={`flex items-center gap-2 ${jobStatus.status === 'error' ? 'text-red-600' : 'text-indigo-600'}`}>
+                        {isGenerating ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileText className="w-4 h-4" />}
+                        {jobStatus.message || 'Job pronto para continuar.'}
                       </span>
                       <span className="text-gray-500">{jobStatus.progress} / {jobStatus.total}</span>
                     </div>
                     <div className="w-full bg-gray-200 rounded-full h-2.5 overflow-hidden">
-                      <div className="bg-indigo-600 h-2.5 rounded-full transition-all duration-500" style={{ width: `${(jobStatus.progress / jobStatus.total) * 100}%` }}></div>
+                      <div className={`h-2.5 rounded-full transition-all duration-500 ${jobStatus.status === 'error' ? 'bg-red-500' : jobStatus.status === 'completed' ? 'bg-green-600' : 'bg-indigo-600'}`} style={{ width: `${progressPercent}%` }}></div>
                     </div>
-                  </div>
-                )}
 
-                {jobStatus && jobStatus.status === 'completed' && (
-                  <div className="mt-6 flex flex-col items-center">
-                    <div className="w-16 h-16 bg-green-100 text-green-600 rounded-full flex items-center justify-center mb-4">
-                      <Download className="w-8 h-8" />
-                    </div>
-                    <h4 className="text-lg font-medium text-gray-900 mb-2">Geração Concluída!</h4>
-                    <p className="text-gray-500 mb-6">Todos os {jobStatus.total} arquivos foram gerados com sucesso.</p>
-                    <button 
-                      onClick={downloadZip}
-                      className="flex items-center gap-2 px-8 py-3 bg-green-600 text-white rounded-full font-medium hover:bg-green-700 shadow-md hover:shadow-lg transition-all"
-                    >
-                      <Download className="w-5 h-5" />
-                      Baixar ZIP
-                    </button>
+                    {isGenerating && (
+                      <div className="mt-4 flex justify-center">
+                        <button
+                          onClick={requestPause}
+                          className="flex items-center gap-2 px-6 py-3 bg-amber-500 text-white rounded-full font-medium hover:bg-amber-600 shadow-md transition-all"
+                        >
+                          <Pause className="w-5 h-5" />
+                          Pausar e Baixar ZIP
+                        </button>
+                      </div>
+                    )}
+
+                    {!isGenerating && jobStatus.status === 'paused' && (
+                      <p className="mt-4 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3">
+                        A geração foi pausada. Ao iniciar novamente, ela continua exatamente de onde parou.
+                      </p>
+                    )}
+
+                    {!isGenerating && jobStatus.status === 'completed' && (
+                      <div className="mt-4 flex flex-col items-center">
+                        <div className="w-16 h-16 bg-green-100 text-green-600 rounded-full flex items-center justify-center mb-4">
+                          <Download className="w-8 h-8" />
+                        </div>
+                        <h4 className="text-lg font-medium text-gray-900 mb-2">Geração Concluída!</h4>
+                        <p className="text-gray-500 mb-4">Todos os {jobStatus.total} arquivos foram gerados com sucesso.</p>
+                        <button
+                          onClick={() => downloadCurrentZip()}
+                          className="flex items-center gap-2 px-8 py-3 bg-green-600 text-white rounded-full font-medium hover:bg-green-700 shadow-md hover:shadow-lg transition-all"
+                        >
+                          <Download className="w-5 h-5" />
+                          Baixar ZIP
+                        </button>
+                      </div>
+                    )}
+
+                    {!isGenerating && jobStatus.status === 'error' && (
+                      <div className="mt-4 p-4 bg-red-50 text-red-700 rounded-lg border border-red-200">
+                        <p className="font-medium">Erro na geração:</p>
+                        <p className="text-sm">{jobStatus.message}</p>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
