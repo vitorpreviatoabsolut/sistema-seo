@@ -1,0 +1,9 @@
+RewriteEngine On
+
+# Se o arquivo ou diretorio existir, entrega normalmente.
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# Redireciona qualquer rota da API para o router PHP.
+RewriteRule ^ index.php [QSA,L]

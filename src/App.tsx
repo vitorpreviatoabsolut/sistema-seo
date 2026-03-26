@@ -7,7 +7,9 @@ import { saveAs } from 'file-saver';
 interface Client {
   id: number;
   name: string;
+  nome?: string; // Fallback para tabelas em PT-BR
   context: string;
+  descricao?: string; // Fallback para tabelas em PT-BR
   whatsapp_number?: string;
   whatsapp_message?: string;
 }
@@ -27,6 +29,75 @@ interface GlobalTemplate {
   name: string;
   content: string;
 }
+
+const getApiBaseUrl = () => {
+  const configuredBase = (import.meta as any).env?.VITE_API_BASE_URL?.trim();
+  const isLocalHost = /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname);
+  const isLocalConfiguredBase = configuredBase
+    ? /:\/\/(localhost|127\.0\.0\.1)(?::\d+)?\b/i.test(configuredBase)
+    : false;
+
+  if (configuredBase && !isLocalConfiguredBase) {
+    return configuredBase.replace(/\/+$/, '');
+  }
+
+  const { origin } = window.location;
+
+  if (isLocalHost) {
+    return 'http://localhost/vitorpreviato.com.br/sistema-seo/api';
+  }
+
+  return `${origin}/api`;
+};
+
+const API_BASE_URL = getApiBaseUrl();
+
+const apiFetch = (path: string, init?: RequestInit) => {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return fetch(`${API_BASE_URL}${normalizedPath}`, init);
+};
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const getErrorMessage = (error: unknown) => {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return 'Erro desconhecido';
+  }
+};
+
+const isRetryableGenerationError = (message: string) => {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('429') ||
+    normalized.includes('503') ||
+    normalized.includes('unavailable') ||
+    normalized.includes('high demand') ||
+    normalized.includes('overloaded') ||
+    normalized.includes('rate limit')
+  );
+};
+
+const parseApiError = async (response: Response, fallbackMessage: string) => {
+  const contentType = response.headers.get('content-type') || '';
+
+  if (contentType.includes('application/json')) {
+    const data = await response.json();
+    return data?.error || fallbackMessage;
+  }
+
+  const text = await response.text();
+  return text || fallbackMessage;
+};
 
 export default function App() {
   const [clients, setClients] = useState<Client[]>([]);
@@ -83,13 +154,31 @@ export default function App() {
   }, [selectedClient]);
 
   const fetchClients = async () => {
-    const res = await fetch('/api/clients');
-    const data = await res.json();
-    setClients(data);
+    try {
+      const res = await apiFetch('/clients');
+      
+      // Verifica se a resposta é JSON válido
+      const contentType = res.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        const text = await res.text();
+        console.error("Resposta não-JSON da API:", text);
+        throw new Error("A API retornou um erro HTML (provavelmente 404 ou 500). Verifique o console.");
+      }
+
+      const data = await res.json();
+      
+      if (!res.ok) throw new Error(data.error || 'Erro na API');
+      
+      console.log("Clientes carregados:", data); // LOG PARA DEBUG
+      setClients(data);
+    } catch (error: any) {
+      console.error("Erro no fetchClients:", error);
+      showToast(error.message || 'Erro ao conectar com o servidor.', 'error');
+    }
   };
 
   const fetchGlobalTemplates = async () => {
-    const res = await fetch('/api/global-templates');
+    const res = await apiFetch('/global-templates');
     const data = await res.json();
     setGlobalTemplates(data);
   };
@@ -97,20 +186,26 @@ export default function App() {
   const addClient = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newClientName) return;
-    const res = await fetch('/api/clients', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newClientName, context: newClientContext })
-    });
-    if (res.ok) {
+    try {
+      const res = await apiFetch('/clients', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newClientName, context: newClientContext })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Erro ao criar cliente');
+      
       setNewClientName('');
       setNewClientContext('');
       fetchClients();
+      showToast('Cliente adicionado com sucesso!');
+    } catch (error: any) {
+      showToast(error.message, 'error');
     }
   };
 
   const deleteClient = async (id: number) => {
-    await fetch(`/api/clients/${id}`, { method: 'DELETE' });
+    await apiFetch(`/clients/${id}`, { method: 'DELETE' });
     if (selectedClient?.id === id) setSelectedClient(null);
     setClientToDelete(null);
     fetchClients();
@@ -118,7 +213,7 @@ export default function App() {
   };
 
   const fetchKeywords = async (clientId: number) => {
-    const res = await fetch(`/api/clients/${clientId}/keywords`);
+    const res = await apiFetch(`/clients/${clientId}/keywords`);
     setKeywords(await res.json());
   };
 
@@ -128,22 +223,27 @@ export default function App() {
     
     const keywordsArray = newKeyword.split(/[\n,]+/).map(k => k.trim()).filter(k => k);
     
-    await fetch(`/api/clients/${selectedClient.id}/keywords/bulk`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ keywords: keywordsArray })
-    });
-    setNewKeyword('');
-    fetchKeywords(selectedClient.id);
+    try {
+      const res = await apiFetch(`/clients/${selectedClient.id}/keywords/bulk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keywords: keywordsArray })
+      });
+      if (!res.ok) throw new Error(await parseApiError(res, 'Erro ao salvar palavras-chave'));
+      setNewKeyword('');
+      fetchKeywords(selectedClient.id);
+    } catch (error: any) {
+      showToast(error.message, 'error');
+    }
   };
 
   const deleteKeyword = async (id: number) => {
-    await fetch(`/api/keywords/${id}`, { method: 'DELETE' });
+    await apiFetch(`/keywords/${id}`, { method: 'DELETE' });
     if (selectedClient) fetchKeywords(selectedClient.id);
   };
 
   const fetchRegions = async (clientId: number) => {
-    const res = await fetch(`/api/clients/${clientId}/regions`);
+    const res = await apiFetch(`/clients/${clientId}/regions`);
     setRegions(await res.json());
   };
 
@@ -153,22 +253,27 @@ export default function App() {
     
     const regionsArray = newRegion.split(/[\n,]+/).map(r => r.trim()).filter(r => r);
     
-    await fetch(`/api/clients/${selectedClient.id}/regions/bulk`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ regions: regionsArray })
-    });
-    setNewRegion('');
-    fetchRegions(selectedClient.id);
+    try {
+      const res = await apiFetch(`/clients/${selectedClient.id}/regions/bulk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ regions: regionsArray })
+      });
+      if (!res.ok) throw new Error('Erro ao salvar regiões');
+      setNewRegion('');
+      fetchRegions(selectedClient.id);
+    } catch (error: any) {
+      showToast(error.message, 'error');
+    }
   };
 
   const deleteRegion = async (id: number) => {
-    await fetch(`/api/regions/${id}`, { method: 'DELETE' });
+    await apiFetch(`/regions/${id}`, { method: 'DELETE' });
     if (selectedClient) fetchRegions(selectedClient.id);
   };
 
   const fetchTemplate = async (clientId: number) => {
-    const res = await fetch(`/api/clients/${clientId}/template`);
+    const res = await apiFetch(`/clients/${clientId}/template`);
     const data = await res.json();
     setTemplate(data.content || `<!DOCTYPE html>
 <html>
@@ -187,7 +292,7 @@ export default function App() {
 
   const saveWhatsappConfig = async () => {
     if (!selectedClient) return;
-    await fetch(`/api/clients/${selectedClient.id}/whatsapp`, {
+    await apiFetch(`/clients/${selectedClient.id}/whatsapp`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ whatsapp_number: whatsappNumber, whatsapp_message: whatsappMessage })
@@ -203,7 +308,7 @@ export default function App() {
 
   const saveTemplate = async () => {
     if (!selectedClient) return;
-    await fetch(`/api/clients/${selectedClient.id}/template`, {
+    await apiFetch(`/clients/${selectedClient.id}/template`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: template })
@@ -214,22 +319,27 @@ export default function App() {
   const saveGlobalTemplate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newTemplateName.trim() || !template.trim()) return;
-    const res = await fetch('/api/global-templates', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newTemplateName, content: template })
-    });
-    if (res.ok) {
+    try {
+      const res = await apiFetch('/global-templates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newTemplateName, content: template })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Erro ao salvar template');
+
       setNewTemplateName('');
       setShowSaveTemplateModal(false);
       fetchGlobalTemplates();
       showToast('Template salvo na biblioteca com sucesso!');
+    } catch (error: any) {
+      showToast(error.message, 'error');
     }
   };
 
   const deleteGlobalTemplate = async (id: number) => {
     if (!confirm('Tem certeza que deseja excluir este template da biblioteca?')) return;
-    await fetch(`/api/global-templates/${id}`, { method: 'DELETE' });
+    await apiFetch(`/global-templates/${id}`, { method: 'DELETE' });
     fetchGlobalTemplates();
     showToast('Template removido da biblioteca.');
   };
@@ -251,7 +361,7 @@ export default function App() {
     }
     
     // Auto-save template before generating
-    await fetch(`/api/clients/${selectedClient.id}/template`, {
+    await apiFetch(`/clients/${selectedClient.id}/template`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: template })
@@ -296,7 +406,7 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
 }`;
 
           let response;
-          let retries = 3;
+          let retries = 5;
           let delay = 5000;
 
           while (retries > 0) {
@@ -324,20 +434,32 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
               });
               break; // Success, exit retry loop
             } catch (err: any) {
-              if (err.message && err.message.includes('429')) {
+              const errorMessage = getErrorMessage(err);
+
+              if (isRetryableGenerationError(errorMessage)) {
                 retries--;
-                if (retries === 0) throw err;
-                setJobStatus({ status: 'running', progress: completed, total, message: `Aguardando limite de requisições... (${retries} tentativas restantes)` });
-                await new Promise(resolve => setTimeout(resolve, delay));
-                delay *= 2; // Exponential backoff
+
+                if (retries === 0) {
+                  throw new Error(`A API do Gemini está temporariamente indisponível ou sobrecarregada. Tente novamente em alguns minutos. Detalhe: ${errorMessage}`);
+                }
+
+                setJobStatus({
+                  status: 'running',
+                  progress: completed,
+                  total,
+                  message: `Gemini indisponível no momento. Nova tentativa em ${Math.ceil(delay / 1000)}s (${retries} restantes)...`
+                });
+
+                await sleep(delay);
+                delay *= 2;
               } else {
-                throw err; // Re-throw if it's not a rate limit error
+                throw err;
               }
             }
           }
 
           // Add a small delay to avoid rate limits
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          await sleep(3000);
 
           let seoText = '';
           let metaDescription = '';
@@ -368,7 +490,8 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
           // Clean up potential markdown blocks just in case
           seoText = seoText.replace(/^```html\n?/m, '').replace(/^```\n?/m, '').replace(/```$/m, '').trim();
 
-          const title = `${keyword}${regionText} - ${selectedClient.name}`;
+          const title = `${keyword}${regionText}`;
+          const companyName = selectedClient.name || selectedClient.nome || '';
           
           // Generate WhatsApp Link
           const cleanNumber = whatsappNumber.replace(/\D/g, '');
@@ -381,6 +504,7 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
           fileContent = fileContent.replace(/\{\{DESCRIPTION\}\}/g, metaDescription);
           fileContent = fileContent.replace(/\{\{KEYWORD\}\}/g, keyword);
           fileContent = fileContent.replace(/\{\{REGION\}\}/g, region);
+          fileContent = fileContent.replace(/\{\{COMPANY_NAME\}\}/g, companyName);
           fileContent = fileContent.replace(/\{\{WHATSAPP_LINK\}\}/g, whatsappLink);
 
           // Create filename: keyword-region.php or keyword.php
@@ -499,7 +623,7 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
               <li key={client.id} className={`flex items-center justify-between p-3 rounded-lg cursor-pointer transition-colors ${selectedClient?.id === client.id ? 'bg-indigo-50 border border-indigo-200' : 'hover:bg-gray-100 border border-transparent'}`} onClick={() => setSelectedClient(client)}>
                 <div className="flex items-center gap-3 overflow-hidden">
                   <Users className={`w-5 h-5 flex-shrink-0 ${selectedClient?.id === client.id ? 'text-indigo-600' : 'text-gray-400'}`} />
-                  <span className="truncate font-medium">{client.name}</span>
+                  <span className="truncate font-medium">{client.name || client.nome || "Sem Nome"}</span>
                 </div>
                 <button 
                   onClick={(e) => { 
@@ -530,8 +654,8 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
         {selectedClient ? (
           <>
             <div className="p-6 border-b border-gray-200 bg-white">
-              <h2 className="text-2xl font-bold text-gray-900">{selectedClient.name}</h2>
-              <p className="text-gray-500 mt-1">{selectedClient.context || 'Sem contexto adicional.'}</p>
+              <h2 className="text-2xl font-bold text-gray-900">{selectedClient.name || selectedClient.nome}</h2>
+              <p className="text-gray-500 mt-1">{selectedClient.context || selectedClient.descricao || 'Sem contexto adicional.'}</p>
             </div>
 
             <div className="flex-1 overflow-y-auto p-6">
@@ -681,13 +805,13 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
                   </div>
                 </div>
                 <p className="text-sm text-gray-500 mb-3">
-                  Use as tags <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{SEO_TEXT}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{TITLE}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{DESCRIPTION}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{KEYWORD}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{REGION}}"}</code> e <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{WHATSAPP_LINK}}"}</code>.
+                  Use as tags <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{SEO_TEXT}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{TITLE}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{DESCRIPTION}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{KEYWORD}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{REGION}}"}</code>, <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{COMPANY_NAME}}"}</code> e <code className="bg-gray-100 px-1 py-0.5 rounded text-indigo-600">{"{{WHATSAPP_LINK}}"}</code>.
                 </p>
                 <textarea
                   className="w-full h-64 font-mono text-sm p-4 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
                   value={template}
                   onChange={(e) => setTemplate(e.target.value)}
-                  placeholder={`<!DOCTYPE html>\n<html>\n<head>\n  <title>{{TITLE}}</title>\n  <meta name="description" content="{{DESCRIPTION}}">\n</head>\n<body>\n  <main>\n    <h1>{{TITLE}}</h1>\n    {{SEO_TEXT}}\n    <a href="{{WHATSAPP_LINK}}" target="_blank">Fale conosco pelo WhatsApp</a>\n  </main>\n</body>\n</html>`}
+                  placeholder={`<!DOCTYPE html>\n<html>\n<head>\n  <title>{{TITLE}}</title>\n  <meta name="description" content="{{DESCRIPTION}}">\n</head>\n<body>\n  <main>\n    <h1>{{TITLE}}</h1>\n    <p>{{COMPANY_NAME}}</p>\n    {{SEO_TEXT}}\n    <a href="{{WHATSAPP_LINK}}" target="_blank">Fale conosco pelo WhatsApp</a>\n  </main>\n</body>\n</html>`}
                 />
               </div>
 
@@ -762,4 +886,3 @@ Retorne o resultado EXCLUSIVAMENTE em formato JSON com a seguinte estrutura:
     </div>
   );
 }
-
